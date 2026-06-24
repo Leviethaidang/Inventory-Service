@@ -98,6 +98,7 @@ async function getInventoryByVariantIds(variantIds) {
             updated_at
         FROM inventory_items
         WHERE variant_id IN (${placeholders})
+          AND is_active = 1
         `,
         cleanVariantIds
     );
@@ -182,7 +183,7 @@ function adminMiddleware(req, res, next) {
 }
 
 function internalMiddleware(req, res, next) {
-    const token = req.headers["x-internal-token"];
+    const apiKey = req.headers["x-internal-api-key"];
 
     if (!process.env.INTERNAL_API_KEY) {
         return res.status(500).json({
@@ -190,7 +191,7 @@ function internalMiddleware(req, res, next) {
         });
     }
 
-    if (!token || token !== process.env.INTERNAL_API_KEY) {
+    if (!apiKey || apiKey !== process.env.INTERNAL_API_KEY) {
         return res.status(403).json({
             error: "Không có quyền gọi internal Inventory API!"
         });
@@ -300,6 +301,7 @@ app.post('/api/inventory/products/summary', async (req, res) => {
                 ) AS quantity_available
             FROM inventory_items
             WHERE product_id IN (${placeholders})
+                AND is_active = 1
             GROUP BY product_id
             `,
             cleanProductIds
@@ -487,6 +489,247 @@ app.put('/api/inventory/admin/variants/:variantId/stock', authMiddleware, adminM
 
         return res.status(500).json({
             error: "Không thể điều chỉnh tồn kho!"
+        });
+
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// ========================================================================
+// ========================================================================
+
+app.post('/api/inventory/internal/products/:productId/deactivate', internalMiddleware, async (req, res) => {
+    const { productId } = req.params;
+
+    let cleanProductId;
+
+    try {
+        cleanProductId = normalizePositiveInt(productId, "productId");
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+
+        const [reservedRows] = await connection.execute(
+            `
+            SELECT
+                variant_id,
+                quantity_reserved
+            FROM inventory_items
+            WHERE product_id = ?
+              AND is_active = 1
+              AND quantity_reserved > 0
+            FOR UPDATE
+            `,
+            [cleanProductId]
+        );
+
+        if (reservedRows.length > 0) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                error: "Không thể xóa sản phẩm vì vẫn có biến thể đang được giữ hàng trong đơn hàng."
+            });
+        }
+
+        await connection.execute(
+            `
+            UPDATE inventory_items
+            SET is_active = 0
+            WHERE product_id = ?
+            `,
+            [cleanProductId]
+        );
+
+        await connection.commit();
+
+        return res.json({
+            message: "Inventory đã deactivate toàn bộ tồn kho của product!"
+        });
+
+    } catch (error) {
+        if (connection) await connection.rollback();
+
+        console.error("Lỗi deactivate inventory theo product:", error);
+
+        return res.status(500).json({
+            error: "Không thể deactivate inventory của product!"
+        });
+
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// ========================================================================
+// INTERNAL: UPSERT INVENTORY CHO TOÀN BỘ VARIANT CỦA 1 PRODUCT
+// ========================================================================
+app.post('/api/inventory/internal/products/:productId/items/bulk-upsert', internalMiddleware, async (req, res) => {
+    const { productId } = req.params;
+    const { items } = req.body || {};
+
+    let cleanProductId;
+
+    try {
+        cleanProductId = normalizePositiveInt(productId, "productId");
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({
+            error: "items không được để trống!"
+        });
+    }
+
+    const cleanItems = [];
+    const duplicateMap = new Set();
+
+    try {
+        for (const item of items) {
+            const variantId = normalizePositiveInt(item.variantId, "variantId");
+            const quantityOnHand = normalizeNonNegativeInt(item.quantityOnHand, "quantityOnHand");
+
+            if (duplicateMap.has(variantId)) {
+                throw new Error(`variantId ${variantId} bị trùng trong request!`);
+            }
+
+            duplicateMap.add(variantId);
+
+            cleanItems.push({
+                variantId,
+                quantityOnHand
+            });
+        }
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+
+        const activeVariantIds = cleanItems.map(item => item.variantId);
+        const placeholders = activeVariantIds.map(() => "?").join(",");
+
+        if (activeVariantIds.length > 0) {
+            const [reservedRows] = await connection.execute(
+                `
+                SELECT
+                    variant_id,
+                    quantity_reserved
+                FROM inventory_items
+                WHERE product_id = ?
+                  AND variant_id NOT IN (${placeholders})
+                  AND quantity_reserved > 0
+                FOR UPDATE
+                `,
+                [cleanProductId, ...activeVariantIds]
+            );
+
+            if (reservedRows.length > 0) {
+                await connection.rollback();
+
+                return res.status(400).json({
+                    error: "Không thể bỏ biến thể đang có hàng được giữ trong đơn hàng."
+                });
+            }
+        }
+
+        await connection.execute(
+            `
+            UPDATE inventory_items
+            SET is_active = 0
+            WHERE product_id = ?
+            `,
+            [cleanProductId]
+        );
+
+        for (const item of cleanItems) {
+            const [existingRows] = await connection.execute(
+                `
+                SELECT
+                    variant_id,
+                    quantity_reserved
+                FROM inventory_items
+                WHERE variant_id = ?
+                FOR UPDATE
+                `,
+                [item.variantId]
+            );
+
+            if (existingRows.length > 0) {
+                const reserved = Number(existingRows[0].quantity_reserved) || 0;
+
+                if (item.quantityOnHand < reserved) {
+                    await connection.rollback();
+
+                    return res.status(400).json({
+                        error: `Tồn kho của variant ${item.variantId} không được nhỏ hơn số lượng đang được giữ.`
+                    });
+                }
+            }
+
+            await connection.execute(
+                `
+                INSERT INTO inventory_items (
+                    variant_id,
+                    product_id,
+                    quantity_on_hand,
+                    quantity_reserved,
+                    quantity_sold,
+                    is_active
+                )
+                VALUES (?, ?, ?, 0, 0, 1)
+                ON DUPLICATE KEY UPDATE
+                    product_id = VALUES(product_id),
+                    quantity_on_hand = VALUES(quantity_on_hand),
+                    is_active = 1
+                `,
+                [
+                    item.variantId,
+                    cleanProductId,
+                    item.quantityOnHand
+                ]
+            );
+
+            await insertMovement(connection, {
+                variantId: item.variantId,
+                movementType: "ADMIN_ADJUST",
+                quantity: item.quantityOnHand,
+                referenceType: "PRODUCT_ADMIN",
+                referenceId: String(cleanProductId),
+                note: "Product Service cập nhật tồn kho theo biến thể"
+            });
+        }
+
+        await connection.commit();
+
+        return res.json({
+            message: "Inventory đã cập nhật tồn kho cho product thành công!"
+        });
+
+    } catch (error) {
+        if (connection) await connection.rollback();
+
+        console.error("Lỗi bulk upsert inventory:", error);
+
+        return res.status(500).json({
+            error: "Không thể cập nhật tồn kho cho product!"
         });
 
     } finally {
@@ -870,15 +1113,6 @@ app.post('/api/inventory/internal/mark-sold', internalMiddleware, async (req, re
     }
 });
 
-// ========================================================================
-// HEALTH CHECK
-// ========================================================================
-app.get('/health', (req, res) => {
-    return res.json({
-        service: "Inventory Service",
-        status: "OK"
-    });
-});
 
 // Khởi chạy Inventory Service
 const PORT = process.env.PORT || 3002;
