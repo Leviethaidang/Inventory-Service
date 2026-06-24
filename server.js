@@ -259,6 +259,67 @@ app.post('/api/inventory/variants/batch', async (req, res) => {
 });
 
 // ========================================================================
+// ROUTE MỞ: LẤY TỔNG TỒN KHO / ĐÃ BÁN THEO NHIỀU PRODUCT
+// Body: { "productIds": [1, 2, 3] }
+// ========================================================================
+app.post('/api/inventory/products/summary', async (req, res) => {
+    const { productIds } = req.body || {};
+
+    if (!Array.isArray(productIds)) {
+        return res.status(400).json({
+            error: "productIds phải là một mảng!"
+        });
+    }
+
+    const cleanProductIds = [...new Set(
+        productIds
+            .map(id => Number(id))
+            .filter(id => Number.isInteger(id) && id > 0)
+    )];
+
+    if (cleanProductIds.length === 0) {
+        return res.json({
+            message: "Lấy summary inventory thành công!",
+            summaries: []
+        });
+    }
+
+    try {
+        const placeholders = cleanProductIds.map(() => "?").join(",");
+
+        const [rows] = await dbPool.execute(
+            `
+            SELECT
+                product_id,
+                COALESCE(SUM(quantity_on_hand), 0) AS quantity_on_hand,
+                COALESCE(SUM(quantity_reserved), 0) AS quantity_reserved,
+                COALESCE(SUM(quantity_sold), 0) AS quantity_sold,
+                GREATEST(
+                    COALESCE(SUM(quantity_on_hand), 0) - COALESCE(SUM(quantity_reserved), 0),
+                    0
+                ) AS quantity_available
+            FROM inventory_items
+            WHERE product_id IN (${placeholders})
+            GROUP BY product_id
+            `,
+            cleanProductIds
+        );
+
+        return res.json({
+            message: "Lấy summary inventory thành công!",
+            summaries: rows
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy inventory summary theo product:", error);
+
+        return res.status(500).json({
+            error: "Không thể lấy inventory summary theo product!"
+        });
+    }
+});
+
+// ========================================================================
 // ROUTE ADMIN: TẠO HOẶC CẬP NHẬT TỒN KHO BAN ĐẦU CHO VARIANT
 // Body: { variantId, productId, quantityOnHand }
 // ========================================================================
